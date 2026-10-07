@@ -31,14 +31,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          ZIP_FILE=$(find . -type f -name "ANETH_DLDM_POS_V*.zip" -print -quit || true)
+          ZIP_FILE=$(find . -type f \
+            -name "ANETH_DLDM_POS_V*.zip" \
+            -print -quit || true)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: ANETH DLDM POS ZIP was not found."
+            echo "ERROR: ANETH DLDM POS ZIP not found."
             exit 1
           fi
 
-          echo "Using project ZIP:"
+          echo "Using:"
           echo "$ZIP_FILE"
 
           rm -rf android_project
@@ -65,7 +67,7 @@ jobs:
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-          echo "Project directory:"
+          echo "Project:"
           echo "$PROJECT_DIR"
 
       - name: Fix Kotlin dependency conflict
@@ -86,7 +88,7 @@ jobs:
 
           EOF
 
-      - name: Fix checkout code
+      - name: Replace checkout method with clean version
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
         shell: bash
         run: |
@@ -100,236 +102,232 @@ jobs:
           )
 
           if not path.exists():
-              raise SystemExit("MainActivity.java not found")
+              raise SystemExit("ERROR: MainActivity.java not found")
 
           text = path.read_text(encoding="utf-8")
 
-          start = text.find('.setPositiveButton("HIFADHI"')
+          # Find checkout method
+          start = text.find("void checkout(){")
 
           if start == -1:
-              raise SystemExit("HIFADHI button not found")
+              raise SystemExit(
+                  "ERROR: void checkout() was not found"
+              )
 
-          end = text.find('});', start)
+          # Find the next method after checkout.
+          # The existing project uses methods declared with:
+          #   void methodName(...)
+          next_method = text.find("\n  void ", start + 5)
 
-          if end == -1:
-              raise SystemExit("HIFADHI lambda end not found")
+          if next_method == -1:
+              next_method = text.find("\n void ", start + 5)
 
-          end += 3
+          if next_method == -1:
+              raise SystemExit(
+                  "ERROR: Could not find the method after checkout()"
+              )
 
-          before = text[:start]
-          block = text[start:end]
-          after = text[end:]
+          clean_checkout = r'''void checkout(){
+    if(cart.isEmpty()){
+        toast("Cart iko tupu");
+        return;
+    }
 
-          # Add final variables at the beginning of the lambda
-          opening = '.setPositiveButton("HIFADHI",(x,w)->{'
+    final SQLiteDatabase saleDb = db.getWritableDatabase();
+    final java.util.HashMap<Integer,Integer> saleCart =
+        new java.util.HashMap<>(cart);
 
-          if opening not in block:
-              raise SystemExit("HIFADHI lambda opening not found")
+    int total = 0;
 
-          final_opening = (
-              '.setPositiveButton("HIFADHI",(x,w)->{'
-              'final int saleTotal=total;'
-              'final String saleCashier=role;'
-              'final SQLiteDatabase saleDb=d;'
-              'final java.util.Map<Integer,Integer> saleCart='
-              'new java.util.HashMap<>(cart);'
+    for(Integer id : saleCart.keySet()){
+        Cursor c = saleDb.rawQuery(
+            "SELECT price,stock FROM drugs WHERE id=?",
+            new String[]{"" + id}
+        );
+
+        if(!c.moveToFirst()){
+            c.close();
+            toast("Dawa haikupatikana");
+            return;
+        }
+
+        int q = saleCart.get(id);
+        int stock = c.getInt(1);
+        int price = c.getInt(0);
+
+        if(q > stock){
+            c.close();
+            toast("Stock haitoshi");
+            return;
+        }
+
+        total += q * price;
+        c.close();
+    }
+
+    final int saleTotal = total;
+    final String saleCashier = role;
+
+    EditText paid = new EditText(this);
+    paid.setHint("Kiasi alicholipa (TZS)");
+    paid.setInputType(2);
+
+    new AlertDialog.Builder(this)
+        .setTitle("Jumla TZS " + saleTotal)
+        .setView(paid)
+        .setPositiveButton("HIFADHI", (x,w) -> {
+
+            int p;
+
+            try{
+                p = Integer.parseInt(
+                    paid.getText().toString()
+                );
+            }catch(Exception e){
+                p = 0;
+            }
+
+            if(p < saleTotal){
+                toast("Malipo hayatoshi");
+                return;
+            }
+
+            ContentValues s = new ContentValues();
+
+            s.put(
+                "created_at",
+                System.currentTimeMillis()
+            );
+
+            s.put("total", saleTotal);
+            s.put("paid", p);
+            s.put(
+                "change_amount",
+                p - saleTotal
+            );
+            s.put(
+                "cashier",
+                saleCashier
+            );
+
+            long sid = saleDb.insert(
+                "sales",
+                null,
+                s
+            );
+
+            for(Integer id : saleCart.keySet()){
+
+                Cursor c = saleDb.rawQuery(
+                    "SELECT generic_name,price FROM drugs WHERE id=?",
+                    new String[]{"" + id}
+                );
+
+                if(!c.moveToFirst()){
+                    c.close();
+                    continue;
+                }
+
+                int q = saleCart.get(id);
+                int pr = c.getInt(1);
+
+                ContentValues it =
+                    new ContentValues();
+
+                it.put("sale_id", sid);
+                it.put("drug_id", id);
+                it.put(
+                    "generic_name",
+                    c.getString(0)
+                );
+                it.put("qty", q);
+                it.put("unit_price", pr);
+                it.put(
+                    "line_total",
+                    q * pr
+                );
+
+                saleDb.insert(
+                    "sale_items",
+                    null,
+                    it
+                );
+
+                saleDb.execSQL(
+                    "UPDATE drugs SET stock=stock-? WHERE id=?",
+                    new Object[]{q,id}
+                );
+
+                c.close();
+            }
+
+            cart.clear();
+
+            toast(
+                "Mauzo yamehifadhiwa. Chenji TZS "
+                + (p - saleTotal)
+            );
+
+            sales();
+        });
+}'''
+
+          # Replace the entire old checkout method
+          text = (
+              text[:start]
+              + clean_checkout
+              + text[next_method:]
           )
 
-          block = block.replace(
-              opening,
-              final_opening,
-              1
-          )
-
-          # --------------------------------------------------
-          # Fix EVERY reference inside the checkout lambda
-          # --------------------------------------------------
-
-          block = block.replace(
-              'if(p<total)',
-              'if(p<saleTotal)'
-          )
-
-          block = block.replace(
-              'if(p < total)',
-              'if(p<saleTotal)'
-          )
-
-          block = block.replace(
-              's.put("total",total)',
-              's.put("total",saleTotal)'
-          )
-
-          block = block.replace(
-              's.put("total", total)',
-              's.put("total",saleTotal)'
-          )
-
-          block = block.replace(
-              's.put("change_amount",p-total)',
-              's.put("change_amount",p-saleTotal)'
-          )
-
-          block = block.replace(
-              's.put("change_amount", p-total)',
-              's.put("change_amount",p-saleTotal)'
-          )
-
-          block = block.replace(
-              's.put("cashier",role)',
-              's.put("cashier",saleCashier)'
-          )
-
-          block = block.replace(
-              's.put("cashier", role)',
-              's.put("cashier",saleCashier)'
-          )
-
-          block = block.replace(
-              'long sid=d.insert("sales",null,s)',
-              'long sid=saleDb.insert("sales",null,s)'
-          )
-
-          block = block.replace(
-              'long sid=d.insert("sales", null, s)',
-              'long sid=saleDb.insert("sales",null,s)'
-          )
-
-          block = block.replace(
-              'for(Integer id:cart.keySet())',
-              'for(Integer id:saleCart.keySet())'
-          )
-
-          block = block.replace(
-              'for (Integer id:cart.keySet())',
-              'for(Integer id:saleCart.keySet())'
-          )
-
-          block = block.replace(
-              'for(Integer id : cart.keySet())',
-              'for(Integer id:saleCart.keySet())'
-          )
-
-          block = block.replace(
-              'for (Integer id : cart.keySet())',
-              'for(Integer id:saleCart.keySet())'
-          )
-
-          block = block.replace(
-              'int q=cart.get(id)',
-              'int q=saleCart.get(id)'
-          )
-
-          block = block.replace(
-              'int q = cart.get(id)',
-              'int q=saleCart.get(id)'
-          )
-
-          block = block.replace(
-              'd.rawQuery(',
-              'saleDb.rawQuery('
-          )
-
-          block = block.replace(
-              'd.insert("sale_items",null,it)',
-              'saleDb.insert("sale_items",null,it)'
-          )
-
-          block = block.replace(
-              'd.insert("sale_items", null, it)',
-              'saleDb.insert("sale_items",null,it)'
-          )
-
-          block = block.replace(
-              'd.execSQL(',
-              'saleDb.execSQL('
-          )
-
-          block = block.replace(
-              'Chenji TZS "+(p-total)',
-              'Chenji TZS "+(p-saleTotal)'
-          )
-
-          block = block.replace(
-              'Chenji TZS "+(p - total)',
-              'Chenji TZS "+(p-saleTotal)'
-          )
-
-          # Rebuild the complete Java source
           path.write_text(
-              before + block + after,
+              text,
               encoding="utf-8"
           )
 
-          print("Checkout code fixed successfully.")
+          print("========================================")
+          print("CHECKOUT METHOD REPLACED SUCCESSFULLY")
+          print("========================================")
 
-          print("")
-          print("===== CHECKOUT BLOCK =====")
-          print(block)
-          print("==========================")
+          # Verify the new checkout method exists
+          if "final java.util.HashMap<Integer,Integer> saleCart" not in text:
+              raise SystemExit(
+                  "ERROR: New checkout method was not inserted."
+              )
+
+          if "int q = saleCart.get(id);" not in text:
+              raise SystemExit(
+                  "ERROR: saleCart quantity code missing."
+              )
+
+          if 'saleDb.insert("sale_items"' not in text:
+              raise SystemExit(
+                  "ERROR: saleDb sale_items insert missing."
+              )
+
+          if "saleDb.execSQL(" not in text:
+              raise SystemExit(
+                  "ERROR: saleDb stock update missing."
+              )
+
+          print("Checkout verification PASSED.")
           PY
 
-      - name: Validate checkout code
+      - name: Show checkout source
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
 
-          FILE="app/src/main/java/com/aneth/dldmpos/MainActivity.java"
+          echo "========================================"
+          echo "CHECKOUT SOURCE"
+          echo "========================================"
 
-          echo "Checking checkout code..."
+          grep -n \
+            "void checkout\|saleCart\|saleDb\|saleTotal" \
+            app/src/main/java/com/aneth/dldmpos/MainActivity.java
 
-          # Extract only the HIFADHI lambda
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path(
-              "app/src/main/java/com/aneth/dldmpos/MainActivity.java"
-          )
-
-          s = p.read_text()
-
-          start = s.find('.setPositiveButton("HIFADHI"')
-          end = s.find('});', start)
-
-          if start == -1 or end == -1:
-              raise SystemExit("Checkout lambda not found")
-
-          block = s[start:end]
-
-          bad = [
-              'int q=cart.get(id)',
-              'int q = cart.get(id)',
-              'd.insert("sale_items"',
-              'd.execSQL(',
-              '(p-total)',
-              '(p - total)'
-          ]
-
-          for item in bad:
-              if item in block:
-                  raise SystemExit(
-                      "ERROR: Old checkout reference remains: " + item
-                  )
-
-          required = [
-              'saleTotal',
-              'saleCashier',
-              'saleDb',
-              'saleCart',
-              'saleCart.get(id)',
-              'saleDb.insert("sale_items"',
-              'saleDb.execSQL('
-          ]
-
-          for item in required:
-              if item not in block:
-                  raise SystemExit(
-                      "ERROR: Required checkout code missing: " + item
-                  )
-
-          print("CHECKOUT VALIDATION PASSED.")
-          PY
+          echo ""
+          echo "Checkout source check complete."
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -368,9 +366,9 @@ jobs:
           echo "APK=$APK" >> "$GITHUB_OUTPUT"
 
           echo ""
-          echo "======================================"
+          echo "========================================"
           echo "APK CREATED SUCCESSFULLY"
-          echo "======================================"
+          echo "========================================"
 
           ls -lh "$APK"
 
