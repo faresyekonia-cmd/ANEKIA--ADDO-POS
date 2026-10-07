@@ -86,7 +86,7 @@ jobs:
 
           EOF
 
-      - name: Fix checkout lambda correctly
+      - name: Fix checkout code
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
         shell: bash
         run: |
@@ -100,24 +100,19 @@ jobs:
           )
 
           if not path.exists():
-              raise SystemExit("ERROR: MainActivity.java not found")
+              raise SystemExit("MainActivity.java not found")
 
           text = path.read_text(encoding="utf-8")
 
           start = text.find('.setPositiveButton("HIFADHI"')
 
           if start == -1:
-              raise SystemExit(
-                  'ERROR: HIFADHI button code was not found'
-              )
+              raise SystemExit("HIFADHI button not found")
 
-          # Find the end of the checkout lambda.
           end = text.find('});', start)
 
           if end == -1:
-              raise SystemExit(
-                  'ERROR: End of HIFADHI lambda was not found'
-              )
+              raise SystemExit("HIFADHI lambda end not found")
 
           end += 3
 
@@ -125,16 +120,13 @@ jobs:
           block = text[start:end]
           after = text[end:]
 
-          print("Original HIFADHI block:")
-          print(block)
+          # Add final variables at the beginning of the lambda
+          opening = '.setPositiveButton("HIFADHI",(x,w)->{'
 
-          # -----------------------------------------------------
-          # Make variables used by the lambda final/effectively final
-          # -----------------------------------------------------
+          if opening not in block:
+              raise SystemExit("HIFADHI lambda opening not found")
 
-          old = '.setPositiveButton("HIFADHI",(x,w)->{'
-
-          new = (
+          final_opening = (
               '.setPositiveButton("HIFADHI",(x,w)->{'
               'final int saleTotal=total;'
               'final String saleCashier=role;'
@@ -143,16 +135,15 @@ jobs:
               'new java.util.HashMap<>(cart);'
           )
 
-          if old not in block:
-              raise SystemExit(
-                  'ERROR: Expected HIFADHI lambda opening not found'
-              )
+          block = block.replace(
+              opening,
+              final_opening,
+              1
+          )
 
-          block = block.replace(old, new, 1)
-
-          # -----------------------------------------------------
-          # Replace EVERY reference inside this lambda
-          # -----------------------------------------------------
+          # --------------------------------------------------
+          # Fix EVERY reference inside the checkout lambda
+          # --------------------------------------------------
 
           block = block.replace(
               'if(p<total)',
@@ -181,11 +172,6 @@ jobs:
 
           block = block.replace(
               's.put("change_amount", p-total)',
-              's.put("change_amount",p-saleTotal)'
-          )
-
-          block = block.replace(
-              's.put("change_amount",p - total)',
               's.put("change_amount",p-saleTotal)'
           )
 
@@ -239,7 +225,6 @@ jobs:
               'int q=saleCart.get(id)'
           )
 
-          # Database references
           block = block.replace(
               'd.rawQuery(',
               'saleDb.rawQuery('
@@ -260,7 +245,6 @@ jobs:
               'saleDb.execSQL('
           )
 
-          # Final message
           block = block.replace(
               'Chenji TZS "+(p-total)',
               'Chenji TZS "+(p-saleTotal)'
@@ -271,81 +255,81 @@ jobs:
               'Chenji TZS "+(p-saleTotal)'
           )
 
-          # -----------------------------------------------------
-          # IMPORTANT:
-          # cart.clear() is allowed because cart is a field.
-          # But use saleCart.clear() instead so the snapshot
-          # remains internally consistent.
-          # -----------------------------------------------------
-
-          block = block.replace(
-              'cart.clear()',
-              'cart.clear()'
+          # Rebuild the complete Java source
+          path.write_text(
+              before + block + after,
+              encoding="utf-8"
           )
 
-          # Rebuild complete Java file
-          text = before + block + after
-
-          path.write_text(text, encoding="utf-8")
+          print("Checkout code fixed successfully.")
 
           print("")
-          print("========================================")
-          print("FIXED HIFADHI LAMBDA")
-          print("========================================")
+          print("===== CHECKOUT BLOCK =====")
           print(block)
-          print("========================================")
+          print("==========================")
+          PY
 
-          # -----------------------------------------------------
-          # Safety check:
-          # There must NOT be these problematic references
-          # inside the HIFADHI lambda.
-          # -----------------------------------------------------
+      - name: Validate checkout code
+        working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          forbidden = [
+          FILE="app/src/main/java/com/aneth/dldmpos/MainActivity.java"
+
+          echo "Checking checkout code..."
+
+          # Extract only the HIFADHI lambda
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/com/aneth/dldmpos/MainActivity.java"
+          )
+
+          s = p.read_text()
+
+          start = s.find('.setPositiveButton("HIFADHI"')
+          end = s.find('});', start)
+
+          if start == -1 or end == -1:
+              raise SystemExit("Checkout lambda not found")
+
+          block = s[start:end]
+
+          bad = [
               'int q=cart.get(id)',
               'int q = cart.get(id)',
-              'd.rawQuery(',
               'd.insert("sale_items"',
               'd.execSQL(',
               '(p-total)',
               '(p - total)'
           ]
 
-          for item in forbidden:
+          for item in bad:
               if item in block:
                   raise SystemExit(
-                      "ERROR: Old reference still exists: " + item
+                      "ERROR: Old checkout reference remains: " + item
                   )
 
-          print("Source validation passed.")
+          required = [
+              'saleTotal',
+              'saleCashier',
+              'saleDb',
+              'saleCart',
+              'saleCart.get(id)',
+              'saleDb.insert("sale_items"',
+              'saleDb.execSQL('
+          ]
+
+          for item in required:
+              if item not in block:
+                  raise SystemExit(
+                      "ERROR: Required checkout code missing: " + item
+                  )
+
+          print("CHECKOUT VALIDATION PASSED.")
           PY
-
-      - name: Show fixed checkout code
-        working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo "CHECKING FINAL JAVA SOURCE"
-          echo "========================================"
-
-          grep -n \
-            "saleTotal\|saleCashier\|saleDb\|saleCart" \
-            app/src/main/java/com/aneth/dldmpos/MainActivity.java || true
-
-          echo ""
-          echo "Checking for old problematic references..."
-
-          if grep -n \
-            'int q=cart.get(id)\|d.rawQuery(\|d.execSQL(' \
-            app/src/main/java/com/aneth/dldmpos/MainActivity.java
-          then
-            echo "ERROR: Old checkout reference still exists."
-            exit 1
-          fi
-
-          echo "Java source check PASSED."
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -365,7 +349,8 @@ jobs:
             assembleDebug \
             --stacktrace
 
-      - name: Verify APK
+      - name: Find APK
+        id: apk
         shell: bash
         run: |
           set -euo pipefail
@@ -380,6 +365,9 @@ jobs:
             exit 1
           fi
 
+          echo "APK=$APK" >> "$GITHUB_OUTPUT"
+
+          echo ""
           echo "======================================"
           echo "APK CREATED SUCCESSFULLY"
           echo "======================================"
@@ -390,6 +378,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ANETH-DLDM-POS-APK
-          path: |
-            android_project/**/build/outputs/apk/debug/*.apk
+          path: ${{ steps.apk.outputs.APK }}
           if-no-files-found: error
