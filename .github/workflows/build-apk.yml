@@ -5,15 +5,26 @@ on:
   push:
     branches:
       - main
+      - master
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
+
+      # =========================================================
+      # CHECKOUT
+      # =========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # =========================================================
+      # JAVA 17
+      # =========================================================
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -21,25 +32,24 @@ jobs:
           java-version: '17'
 
       # =========================================================
-      # FIND AND EXTRACT THE ANDROID PROJECT ZIP
+      # FIND AND EXTRACT PROJECT ZIP
       # =========================================================
-      - name: Find and extract project ZIP
+      - name: Find and extract Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Searching for ANETH DLDM POS ZIP..."
+          echo "Searching for ANETH DLDM POS project..."
 
           ZIP_FILE=$(find . -type f -name "ANETH_DLDM_POS_V*.zip" -print -quit || true)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: ANETH DLDM POS project ZIP was not found."
-            echo "Files currently in repository:"
+            echo "ERROR: ANETH DLDM POS ZIP was not found."
             find . -maxdepth 4 -type f | head -200
             exit 1
           fi
 
-          echo "Using ZIP:"
+          echo "Using:"
           echo "$ZIP_FILE"
 
           rm -rf android_project
@@ -47,11 +57,12 @@ jobs:
 
           unzip -q "$ZIP_FILE" -d android_project
 
-          echo "Extracted project:"
-          find android_project -maxdepth 4 -type f | head -150
+          echo "Project extracted."
+
+          find android_project -maxdepth 5 -type f | head -150
 
       # =========================================================
-      # FIND ANDROID PROJECT
+      # FIND PROJECT DIRECTORY
       # =========================================================
       - name: Find Android project
         id: project
@@ -65,7 +76,6 @@ jobs:
 
           if [ -z "$SETTINGS" ]; then
             echo "ERROR: settings.gradle was not found."
-            find android_project -maxdepth 5 -type f
             exit 1
           fi
 
@@ -73,11 +83,11 @@ jobs:
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-          echo "Android project found at:"
+          echo "Android project:"
           echo "$PROJECT_DIR"
 
       # =========================================================
-      # FIX KOTLIN DUPLICATE CLASS ERROR
+      # FIX KOTLIN DEPENDENCY
       # =========================================================
       - name: Fix Kotlin dependency conflict
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
@@ -87,9 +97,6 @@ jobs:
 
           cat >> app/build.gradle <<'EOF'
 
-          // =====================================================
-          // ANETH DLDM POS - Kotlin dependency compatibility fix
-          // =====================================================
           configurations.configureEach {
               resolutionStrategy.force(
                   'org.jetbrains.kotlin:kotlin-stdlib:1.8.22',
@@ -97,14 +104,15 @@ jobs:
                   'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
               )
           }
+
           EOF
 
           echo "Kotlin dependency fix applied."
 
       # =========================================================
-      # FIX JAVA LAMBDA VARIABLE ERROR
+      # FIX MAINACTIVITY JAVA
       # =========================================================
-      - name: Fix Java lambda variables
+      - name: Fix MainActivity Java checkout lambda
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
         shell: bash
         run: |
@@ -113,128 +121,209 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          file = Path(
-              "app/src/main/java/com/aneth/dldmpos/MainActivity.java"
-          )
+          path = Path("app/src/main/java/com/aneth/dldmpos/MainActivity.java")
 
-          if not file.exists():
-              raise SystemExit(
-                  "ERROR: MainActivity.java was not found."
-              )
+          if not path.exists():
+              raise SystemExit("ERROR: MainActivity.java not found")
 
-          text = file.read_text(encoding="utf-8")
+          text = path.read_text(encoding="utf-8")
 
-          marker = "EditText paid=new EditText(this);"
+          print("Fixing MainActivity.java...")
+
+          # -----------------------------------------------------
+          # Create final copies BEFORE the lambda
+          # -----------------------------------------------------
+
+          marker = 'EditText paid=new EditText(this);'
 
           if marker not in text:
               raise SystemExit(
-                  "ERROR: Checkout code marker was not found."
+                  "ERROR: Checkout marker was not found in MainActivity.java"
               )
 
-          start = text.index(marker)
+          if 'final int saleTotal = total;' not in text:
 
-          end_marker = "sales();"
-
-          end = text.find(end_marker, start)
-
-          if end == -1:
-              raise SystemExit(
-                  "ERROR: End of checkout code was not found."
-              )
-
-          end += len(end_marker)
-
-          block = text[start:end]
-
-          # -----------------------------------------------------
-          # Create final/effectively-final copies for lambda
-          # -----------------------------------------------------
-          prefix = """
-          final int saleTotal = total;
+              insert = '''final int saleTotal = total;
           final String saleCashier = role;
           final android.database.sqlite.SQLiteDatabase saleDb = d;
           final java.util.Map<Integer,Integer> saleCart =
               new java.util.HashMap<>(cart);
-          """
 
-          block = block.replace(
-              marker,
-              prefix + marker,
-              1
-          )
+          EditText paid=new EditText(this);'''
+
+              text = text.replace(
+                  marker,
+                  insert,
+                  1
+              )
 
           # -----------------------------------------------------
-          # Replace variables used inside lambda
+          # Replace variables inside lambda
           # -----------------------------------------------------
 
-          block = block.replace(
-              "if(p<total)",
-              "if(p<saleTotal)"
-          )
+          replacements = {
 
-          block = block.replace(
-              's.put("total",total)',
-              's.put("total",saleTotal)'
-          )
+              # total
+              'if(p<total)':
+              'if(p<saleTotal)',
 
-          block = block.replace(
-              's.put("change_amount",p-total)',
-              's.put("change_amount",p-saleTotal)'
-          )
+              'if (p<total)':
+              'if (p<saleTotal)',
 
-          block = block.replace(
-              's.put("cashier",role)',
-              's.put("cashier",saleCashier)'
-          )
+              's.put("total",total)':
+              's.put("total",saleTotal)',
 
-          block = block.replace(
-              'long sid=d.insert("sales",null,s)',
-              'long sid=saleDb.insert("sales",null,s)'
-          )
+              's.put("total", total)':
+              's.put("total", saleTotal)',
 
-          block = block.replace(
-              "for(Integer id:cart.keySet())",
-              "for(Integer id:saleCart.keySet())"
-          )
+              's.put("change_amount",p-total)':
+              's.put("change_amount",p-saleTotal)',
 
-          block = block.replace(
-              "int q=cart.get(id)",
-              "int q=saleCart.get(id)"
-          )
+              's.put("change_amount", p-total)':
+              's.put("change_amount", p-saleTotal)',
 
-          block = block.replace(
-              'd.rawQuery(',
-              'saleDb.rawQuery('
-          )
+              'toast("Mauzo yamehifadhiwa. Chenji TZS "+(p-total))':
+              'toast("Mauzo yamehifadhiwa. Chenji TZS "+(p-saleTotal))',
 
-          block = block.replace(
-              'd.insert("sale_items",null,it)',
-              'saleDb.insert("sale_items",null,it)'
-          )
+              'toast("Mauzo yamehifadhiwa. Chenji TZS "+(p - total))':
+              'toast("Mauzo yamehifadhiwa. Chenji TZS "+(p-saleTotal))',
 
-          block = block.replace(
-              'd.execSQL(',
+              # role
+              's.put("cashier",role)':
+              's.put("cashier",saleCashier)',
+
+              's.put("cashier", role)':
+              's.put("cashier", saleCashier)',
+
+              # database
+              'long sid=d.insert("sales",null,s)':
+              'long sid=saleDb.insert("sales",null,s)',
+
+              'long sid = d.insert("sales",null,s)':
+              'long sid=saleDb.insert("sales",null,s)',
+
+              # cart
+              'for(Integer id:cart.keySet())':
+              'for(Integer id:saleCart.keySet())',
+
+              'for (Integer id:cart.keySet())':
+              'for (Integer id:saleCart.keySet())',
+
+              'for(Integer id : cart.keySet())':
+              'for(Integer id:saleCart.keySet())',
+
+              'int q=cart.get(id)':
+              'int q=saleCart.get(id)',
+
+              'int q = cart.get(id)':
+              'int q=saleCart.get(id)',
+
+              # database queries
+              'd.rawQuery(':
+              'saleDb.rawQuery(',
+
+              'd.insert("sale_items",null,it)':
+              'saleDb.insert("sale_items",null,it)',
+
+              'd.insert("sale_items", null, it)':
+              'saleDb.insert("sale_items",null,it)',
+
+              'd.execSQL(':
               'saleDb.execSQL('
+          }
+
+          for old, new in replacements.items():
+              text = text.replace(old, new)
+
+          # -----------------------------------------------------
+          # IMPORTANT:
+          # cart.clear() itself is outside the lambda concern,
+          # but make sure the lambda does not reference total.
+          # -----------------------------------------------------
+
+          text = text.replace(
+              '(p-total)',
+              '(p-saleTotal)'
           )
 
-          block = block.replace(
-              '"Chenji TZS "+(p-total)',
-              '"Chenji TZS "+(p-saleTotal)'
+          text = text.replace(
+              '(p - total)',
+              '(p-saleTotal)'
           )
 
           # -----------------------------------------------------
-          # Put corrected block back into MainActivity.java
+          # Verify that problematic references are gone
           # -----------------------------------------------------
 
-          text = text[:start] + block + text[end:]
+          # Look specifically at the checkout area.
+          start = text.find('EditText paid=')
 
-          file.write_text(text, encoding="utf-8")
+          if start == -1:
+              raise SystemExit("ERROR: Checkout section disappeared")
 
-          print("Java lambda fix applied successfully.")
+          checkout = text[start:start + 6000]
+
+          if 'p-total' in checkout:
+              raise SystemExit(
+                  "ERROR: p-total still exists in checkout lambda"
+              )
+
+          if 'p - total' in checkout:
+              raise SystemExit(
+                  "ERROR: p - total still exists in checkout lambda"
+              )
+
+          if 's.put("total",total)' in checkout:
+              raise SystemExit(
+                  "ERROR: total reference still exists"
+              )
+
+          if 's.put("cashier",role)' in checkout:
+              raise SystemExit(
+                  "ERROR: role reference still exists"
+              )
+
+          if 'd.rawQuery(' in checkout:
+              raise SystemExit(
+                  "ERROR: database reference d.rawQuery still exists"
+              )
+
+          if 'for(Integer id:cart.keySet())' in checkout:
+              raise SystemExit(
+                  "ERROR: cart reference still exists"
+              )
+
+          # -----------------------------------------------------
+          # Save
+          # -----------------------------------------------------
+
+          path.write_text(text, encoding="utf-8")
+
+          print("======================================")
+          print("MAINACTIVITY FIX SUCCESSFUL")
+          print("======================================")
+
           PY
 
       # =========================================================
-      # SET UP GRADLE
+      # SHOW FIXED CODE FOR DEBUGGING
+      # =========================================================
+      - name: Verify Java source
+        working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking MainActivity.java..."
+
+          grep -n "saleTotal\|saleCashier\|saleDb\|saleCart" \
+            app/src/main/java/com/aneth/dldmpos/MainActivity.java \
+            || true
+
+          echo "Java source check completed."
+
+      # =========================================================
+      # SETUP GRADLE
       # =========================================================
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -264,12 +353,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          APK="$(
-            find "${{ steps.project.outputs.PROJECT_DIR }}" \
+          APK=$(find "${{ steps.project.outputs.PROJECT_DIR }}" \
             -type f \
             -path "*/build/outputs/apk/debug/*.apk" \
-            -print -quit
-          )"
+            -print -quit)
 
           if [ -z "$APK" ]; then
             echo "ERROR: APK was not generated."
@@ -279,7 +366,9 @@ jobs:
           echo "======================================"
           echo "APK CREATED SUCCESSFULLY"
           echo "======================================"
+
           echo "$APK"
+
           ls -lh "$APK"
 
       # =========================================================
