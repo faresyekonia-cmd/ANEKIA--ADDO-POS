@@ -20,29 +20,80 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Extract Android project ZIP
+      - name: Find and extract project ZIP
+        shell: bash
         run: |
+          set -euxo pipefail
+
+          echo "Searching for ZIP file..."
+
+          ZIP_FILE=$(find . -type f -name "*.zip" -print -quit)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in repository."
+            echo "Files in repository:"
+            find . -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+          echo "ZIP found:"
+          echo "$ZIP_FILE"
+
+          rm -rf android_project
           mkdir -p android_project
-          unzip -q *.zip -d android_project
+
+          unzip -q "$ZIP_FILE" -d android_project
 
           echo "Extracted files:"
-          find android_project -maxdepth 3 -type f | head -100
+          find android_project -maxdepth 4 -type f | head -150
 
       - name: Find Android project
         id: project
+        shell: bash
         run: |
-          SETTINGS=$(find android_project -name "settings.gradle" -o -name "settings.gradle.kts" | head -1)
+          SETTINGS=$(find android_project \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -print -quit)
 
           if [ -z "$SETTINGS" ]; then
             echo "ERROR: settings.gradle not found"
+            find android_project -maxdepth 5 -type f
             exit 1
           fi
 
           PROJECT_DIR=$(dirname "$SETTINGS")
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
           echo "Android project found at:"
           echo "$PROJECT_DIR"
+
+      - name: Fix Kotlin dependency conflict
+        working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Checking app/build.gradle..."
+
+          if [ ! -f app/build.gradle ]; then
+            echo "ERROR: app/build.gradle not found"
+            exit 1
+          fi
+
+          cat >> app/build.gradle <<'EOF'
+
+          // Fix Kotlin stdlib duplicate-class conflict
+          configurations.configureEach {
+              resolutionStrategy.force(
+                  'org.jetbrains.kotlin:kotlin-stdlib:1.8.22',
+                  'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22',
+                  'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+              )
+          }
+          EOF
+
+          echo "Kotlin conflict fix added."
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -51,11 +102,13 @@ jobs:
 
       - name: Build APK
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
+        shell: bash
         run: |
-          gradle assembleDebug --stacktrace
+          gradle --no-daemon clean assembleDebug --stacktrace
 
       - name: Find APK
         run: |
+          echo "Searching for APK..."
           find android_project -type f -name "*.apk" -print
 
       - name: Upload APK
