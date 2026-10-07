@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download project
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -20,23 +20,26 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # =========================================================
+      # FIND AND EXTRACT THE ANDROID PROJECT ZIP
+      # =========================================================
       - name: Find and extract project ZIP
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          echo "Searching for ZIP file..."
+          echo "Searching for ANETH DLDM POS ZIP..."
 
-          ZIP_FILE=$(find . -type f -name "*.zip" -print -quit)
+          ZIP_FILE=$(find . -type f -name "ANETH_DLDM_POS_V*.zip" -print -quit || true)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found in repository."
-            echo "Files in repository:"
+            echo "ERROR: ANETH DLDM POS project ZIP was not found."
+            echo "Files currently in repository:"
             find . -maxdepth 4 -type f | head -200
             exit 1
           fi
 
-          echo "ZIP found:"
+          echo "Using ZIP:"
           echo "$ZIP_FILE"
 
           rm -rf android_project
@@ -44,19 +47,24 @@ jobs:
 
           unzip -q "$ZIP_FILE" -d android_project
 
-          echo "Extracted files:"
+          echo "Extracted project:"
           find android_project -maxdepth 4 -type f | head -150
 
+      # =========================================================
+      # FIND ANDROID PROJECT
+      # =========================================================
       - name: Find Android project
         id: project
         shell: bash
         run: |
+          set -euo pipefail
+
           SETTINGS=$(find android_project \
             \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
             -print -quit)
 
           if [ -z "$SETTINGS" ]; then
-            echo "ERROR: settings.gradle not found"
+            echo "ERROR: settings.gradle was not found."
             find android_project -maxdepth 5 -type f
             exit 1
           fi
@@ -68,22 +76,20 @@ jobs:
           echo "Android project found at:"
           echo "$PROJECT_DIR"
 
+      # =========================================================
+      # FIX KOTLIN DUPLICATE CLASS ERROR
+      # =========================================================
       - name: Fix Kotlin dependency conflict
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
         shell: bash
         run: |
-          set -euxo pipefail
-
-          echo "Checking app/build.gradle..."
-
-          if [ ! -f app/build.gradle ]; then
-            echo "ERROR: app/build.gradle not found"
-            exit 1
-          fi
+          set -euo pipefail
 
           cat >> app/build.gradle <<'EOF'
 
-          // Fix Kotlin stdlib duplicate-class conflict
+          // =====================================================
+          // ANETH DLDM POS - Kotlin dependency compatibility fix
+          // =====================================================
           configurations.configureEach {
               resolutionStrategy.force(
                   'org.jetbrains.kotlin:kotlin-stdlib:1.8.22',
@@ -93,24 +99,192 @@ jobs:
           }
           EOF
 
-          echo "Kotlin conflict fix added."
+          echo "Kotlin dependency fix applied."
 
+      # =========================================================
+      # FIX JAVA LAMBDA VARIABLE ERROR
+      # =========================================================
+      - name: Fix Java lambda variables
+        working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          file = Path(
+              "app/src/main/java/com/aneth/dldmpos/MainActivity.java"
+          )
+
+          if not file.exists():
+              raise SystemExit(
+                  "ERROR: MainActivity.java was not found."
+              )
+
+          text = file.read_text(encoding="utf-8")
+
+          marker = "EditText paid=new EditText(this);"
+
+          if marker not in text:
+              raise SystemExit(
+                  "ERROR: Checkout code marker was not found."
+              )
+
+          start = text.index(marker)
+
+          end_marker = "sales();"
+
+          end = text.find(end_marker, start)
+
+          if end == -1:
+              raise SystemExit(
+                  "ERROR: End of checkout code was not found."
+              )
+
+          end += len(end_marker)
+
+          block = text[start:end]
+
+          # -----------------------------------------------------
+          # Create final/effectively-final copies for lambda
+          # -----------------------------------------------------
+          prefix = """
+          final int saleTotal = total;
+          final String saleCashier = role;
+          final android.database.sqlite.SQLiteDatabase saleDb = d;
+          final java.util.Map<Integer,Integer> saleCart =
+              new java.util.HashMap<>(cart);
+          """
+
+          block = block.replace(
+              marker,
+              prefix + marker,
+              1
+          )
+
+          # -----------------------------------------------------
+          # Replace variables used inside lambda
+          # -----------------------------------------------------
+
+          block = block.replace(
+              "if(p<total)",
+              "if(p<saleTotal)"
+          )
+
+          block = block.replace(
+              's.put("total",total)',
+              's.put("total",saleTotal)'
+          )
+
+          block = block.replace(
+              's.put("change_amount",p-total)',
+              's.put("change_amount",p-saleTotal)'
+          )
+
+          block = block.replace(
+              's.put("cashier",role)',
+              's.put("cashier",saleCashier)'
+          )
+
+          block = block.replace(
+              'long sid=d.insert("sales",null,s)',
+              'long sid=saleDb.insert("sales",null,s)'
+          )
+
+          block = block.replace(
+              "for(Integer id:cart.keySet())",
+              "for(Integer id:saleCart.keySet())"
+          )
+
+          block = block.replace(
+              "int q=cart.get(id)",
+              "int q=saleCart.get(id)"
+          )
+
+          block = block.replace(
+              'd.rawQuery(',
+              'saleDb.rawQuery('
+          )
+
+          block = block.replace(
+              'd.insert("sale_items",null,it)',
+              'saleDb.insert("sale_items",null,it)'
+          )
+
+          block = block.replace(
+              'd.execSQL(',
+              'saleDb.execSQL('
+          )
+
+          block = block.replace(
+              '"Chenji TZS "+(p-total)',
+              '"Chenji TZS "+(p-saleTotal)'
+          )
+
+          # -----------------------------------------------------
+          # Put corrected block back into MainActivity.java
+          # -----------------------------------------------------
+
+          text = text[:start] + block + text[end:]
+
+          file.write_text(text, encoding="utf-8")
+
+          print("Java lambda fix applied successfully.")
+          PY
+
+      # =========================================================
+      # SET UP GRADLE
+      # =========================================================
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
+      # =========================================================
+      # BUILD APK
+      # =========================================================
       - name: Build APK
         working-directory: ${{ steps.project.outputs.PROJECT_DIR }}
         shell: bash
         run: |
-          gradle --no-daemon clean assembleDebug --stacktrace
+          set -euo pipefail
 
-      - name: Find APK
+          gradle \
+            --no-daemon \
+            clean \
+            assembleDebug \
+            --stacktrace
+
+      # =========================================================
+      # VERIFY APK
+      # =========================================================
+      - name: Verify APK
+        shell: bash
         run: |
-          echo "Searching for APK..."
-          find android_project -type f -name "*.apk" -print
+          set -euo pipefail
 
+          APK="$(
+            find "${{ steps.project.outputs.PROJECT_DIR }}" \
+            -type f \
+            -path "*/build/outputs/apk/debug/*.apk" \
+            -print -quit
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "======================================"
+          echo "APK CREATED SUCCESSFULLY"
+          echo "======================================"
+          echo "$APK"
+          ls -lh "$APK"
+
+      # =========================================================
+      # UPLOAD APK
+      # =========================================================
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
